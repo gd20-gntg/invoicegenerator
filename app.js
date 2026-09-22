@@ -61,6 +61,8 @@ let listLoadedOnce = false;
 let lastInvoices = [];
 let statusFilter = "all";
 let brandFilter = "all";
+let searchQuery = "";
+let sortOrder = "desc";
 
 const MONTH_NAMES = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
 
@@ -314,7 +316,7 @@ function mdBoldToHtml(s) {
 function buildInvoiceCode() {
   const brand = BRANDS[state.brand];
   const dateStr = (el("invoiceDate").value || todayISO()).replace(/-/g, "");
-  const typeTag = { quotation: "QUOTE", dp: "DP", final: "FP" }[state.type];
+  const typeTag = { quotation: "QUOTE", dp: "DP", final: "LUNAS" }[state.type];
   return `${brand.code}-${dateStr}-${slug(el("clientName").value)}-${typeTag}`;
 }
 
@@ -392,7 +394,6 @@ function gatherPayload() {
     remainingBalance: c.remainingBalance,
     dpPaidDate: el("dpPaidDate").value || null,
     existingPageUrl: el("existingPageUrl").value || null,
-    metodePembayaran: el("metodePembayaran").value,
     internalNotes: el("internalNotes").value,
   };
 }
@@ -456,7 +457,17 @@ function statusBadgeClass(status) {
 
 function applyFilterAndRender() {
   const brandScoped = brandFilter === "all" ? lastInvoices : lastInvoices.filter((inv) => inv.brand === brandFilter);
-  const filtered = statusFilter === "all" ? brandScoped : brandScoped.filter((inv) => inv.status === statusFilter);
+  let filtered = statusFilter === "all" ? brandScoped : brandScoped.filter((inv) => inv.status === statusFilter);
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    filtered = filtered.filter((inv) => (inv.name || "").toLowerCase().includes(q) || (inv.brand || "").toLowerCase().includes(q));
+  }
+  filtered = [...filtered].sort((a, b) => {
+    const da = a.invoiceDate || "";
+    const db = b.invoiceDate || "";
+    if (da === db) return 0;
+    return sortOrder === "asc" ? (da < db ? -1 : 1) : (da > db ? -1 : 1);
+  });
   renderSummary(filtered);
   renderTable(filtered);
 }
@@ -497,10 +508,59 @@ function renderTable(invoices) {
         <div class="row-actions">
           ${inv.url ? `<a href="${inv.url}" target="_blank" rel="noopener">Buka</a>` : ""}
           ${paymentActionButtons(inv)}
+          ${inv.id ? `<button type="button" class="btn-mini btn-danger" data-action="delete" data-id="${inv.id}">Hapus</button>` : ""}
         </div>
       </td>
     </tr>
   `).join("");
+}
+
+// ===================== Continue DP invoice → Final Payment =====================
+// "Invoice DP" -> "Alamii Food"
+function deriveClientNameFromInvoiceName(invoiceName) {
+  const parts = (invoiceName || "").split("—");
+  return (parts.length > 1 ? parts[parts.length - 1] : invoiceName || "").trim();
+}
+
+async function continueToFinalPayment(inv, passcode) {
+  document.querySelector('#viewToggle .pill[data-value="create"]')?.click();
+
+  const brandBtn = document.querySelector(`#brandToggle .pill[data-value="${(inv.brand || "").toLowerCase()}"]`);
+  if (brandBtn) brandBtn.click();
+
+  document.querySelector('#docTypeToggle .pill[data-value="invoice"]')?.click();
+  document.querySelector('#typeToggle .pill[data-value="final"]')?.click();
+
+  el("clientName").value = deriveClientNameFromInvoiceName(inv.name);
+  el("existingPageUrl").value = inv.url || "";
+  el("dpPaidAmount").value = inv.dpAmount || 0;
+  renderPreview();
+  el("contactPerson").focus();
+
+  const statusEl = el("statusMsg");
+  statusEl.textContent = "Nama klien, link Notion, & nominal DP udah ke-prefill. Lagi narik item dari invoice DP-nya...";
+  statusEl.className = "status";
+
+  try {
+    const res = await fetch(`/api/get-invoice-items?pageUrl=${encodeURIComponent(inv.url || "")}`, {
+      headers: { "x-admin-passcode": passcode },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Gagal ambil item");
+    if (data.items && data.items.length) {
+      state.items = data.items;
+      renderItems();
+      renderPreview();
+      statusEl.textContent = `${data.items.length} item dari invoice DP berhasil ditarik otomatis. Tambahin item/biaya baru kalau ada (misal overtime), terus cek lagi totalnya.`;
+      statusEl.className = "status ok";
+    } else {
+      statusEl.textContent = "Gak nemu item di invoice DP-nya — masukin manual ya.";
+      statusEl.className = "status err";
+    }
+  } catch (err) {
+    statusEl.textContent = "Gagal narik item otomatis (" + err.message + ") — masukin manual ya.";
+    statusEl.className = "status err";
+  }
 }
 
 function paymentActionButtons(inv) {
@@ -510,6 +570,7 @@ function paymentActionButtons(inv) {
   }
   if (inv.status === "DP Masuk") {
     return `
+      <button type="button" class="btn-mini btn-continue" data-action="continue_final" data-id="${inv.id}">Lanjut ke Pelunasan</button>
       <button type="button" class="btn-mini" data-action="full_payment_received" data-id="${inv.id}">Tandai Lunas</button>
       <button type="button" class="btn-mini btn-undo" data-action="undo_dp" data-id="${inv.id}">Batalkan DP</button>
     `;
@@ -549,7 +610,7 @@ let pendingPayment = null; // { inv, action }
 
 const PAYMENT_ACTION_LABELS = {
   dp_received: "Tandai DP Diterima",
-  full_payment_received: "Tandai Lunas / Full Payment",
+  full_payment_received: "Tandai Lunas",
   undo_dp: "Batalkan Status DP",
   undo_full_payment: "Batalkan Status Lunas",
 };
@@ -558,6 +619,9 @@ function openPaymentModal(inv, action) {
   pendingPayment = { inv, action };
   el("paymentModalTitle").textContent = PAYMENT_ACTION_LABELS[action] || "Tandai Pembayaran";
   el("paymentDate").value = todayISO();
+  const isUndo = action.startsWith("undo_");
+  el("paymentMetodeField").classList.toggle("hidden", isUndo);
+  if (!isUndo) el("paymentMetode").value = "Transfer";
   el("paymentModal").classList.remove("hidden");
 }
 
@@ -565,6 +629,7 @@ async function markPayment(passcode) {
   if (!pendingPayment) return;
   const { inv, action } = pendingPayment;
   const date = el("paymentDate").value || todayISO();
+  const isUndo = action.startsWith("undo_");
   const statusEl = el("listStatusMsg");
   statusEl.textContent = "Menyimpan status...";
   statusEl.className = "status";
@@ -580,6 +645,7 @@ async function markPayment(passcode) {
         invoiceName: inv.name,
         total: inv.total,
         dpAmount: inv.dpAmount,
+        metodePembayaran: isUndo ? null : el("paymentMetode").value,
       }),
     });
     const data = await res.json();
@@ -593,6 +659,28 @@ async function markPayment(passcode) {
         : "Status berhasil diupdate ✓";
       statusEl.className = "status ok";
     }
+    loadInvoiceList(passcode);
+  } catch (err) {
+    statusEl.textContent = "Gagal: " + err.message;
+    statusEl.className = "status err";
+  }
+}
+
+// ===================== Delete invoice =====================
+async function deleteInvoice(inv, passcode) {
+  const statusEl = el("listStatusMsg");
+  statusEl.textContent = "Menghapus invoice...";
+  statusEl.className = "status";
+  try {
+    const res = await fetch("/api/delete-invoice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-passcode": passcode },
+      body: JSON.stringify({ pageId: inv.id }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Gagal menghapus");
+    statusEl.textContent = "Invoice berhasil dihapus (diarsipkan di Notion) ✓";
+    statusEl.className = "status ok";
     loadInvoiceList(passcode);
   } catch (err) {
     statusEl.textContent = "Gagal: " + err.message;
@@ -617,7 +705,7 @@ function updateFieldVisibility() {
   } else if (isDp) {
     urlLabel.textContent = "Link Quotation/Invoice sebelumnya di Notion (kalau ada — biar ditambahin ke page yang sama, bukan bikin baris baru)";
   } else {
-    urlLabel.textContent = "Link Invoice DP di Notion (kalau ada — biar diupdate, bukan bikin baris baru)";
+    urlLabel.textContent = "Link Invoice DP di Notion — WAJIB diisi kalau klien ini sebelumnya udah DP (pakai tombol \"Lanjut ke Pelunasan\" di Daftar Invoice biar otomatis). Kosongin kalau klien ini langsung lunas tanpa DP sebelumnya.";
   }
 }
 
@@ -697,6 +785,13 @@ document.addEventListener("DOMContentLoaded", () => {
   el("downloadPdfBtn").addEventListener("click", downloadPdf);
 
   el("saveNotionBtn").addEventListener("click", () => {
+    const dpPaidNow = Number(el("dpPaidAmount").value) || 0;
+    if (state.type === "final" && !el("existingPageUrl").value && dpPaidNow > 0) {
+      const proceed = confirm(
+        "Kamu isi 'DP yang Sudah Diterima' tapi belum isi 'Link Quotation/Invoice sebelumnya di Notion'. Tanpa link, ini bakal bikin ROW BARU yang terpisah dari invoice DP-nya (bukan lanjutan di row yang sama).\n\nLanjut bikin baru?"
+      );
+      if (!proceed) return;
+    }
     withPasscode((code) => saveToNotion(code));
   });
   el("passcodeCancel").addEventListener("click", () => {
@@ -734,12 +829,32 @@ document.addEventListener("DOMContentLoaded", () => {
   el("listYear").addEventListener("change", () => withPasscode((code) => loadInvoiceList(code)));
   wireToggle("statusFilter", (val) => { statusFilter = val; applyFilterAndRender(); });
   wireToggle("brandFilter", (val) => { brandFilter = val; applyFilterAndRender(); });
+  el("searchInput").addEventListener("input", () => {
+    searchQuery = el("searchInput").value;
+    applyFilterAndRender();
+  });
+  el("sortOrder").addEventListener("change", () => {
+    sortOrder = el("sortOrder").value;
+    applyFilterAndRender();
+  });
 
   el("listTableBody").addEventListener("click", (e) => {
     const btn = e.target.closest(".btn-mini");
     if (!btn) return;
     const inv = lastInvoices.find((i) => i.id === btn.dataset.id);
     if (!inv) return;
+    if (btn.dataset.action === "continue_final") {
+      withPasscode((code) => continueToFinalPayment(inv, code));
+      return;
+    }
+    if (btn.dataset.action === "delete") {
+      const proceed = confirm(
+        `Yakin mau hapus invoice "${inv.name}"?\n\nIni bakal diarsipkan di Notion (masuk Trash) — masih bisa dipulihkan dari sana kalau salah hapus, tapi bakal langsung ilang dari daftar invoice di sini.`
+      );
+      if (!proceed) return;
+      withPasscode((code) => deleteInvoice(inv, code));
+      return;
+    }
     openPaymentModal(inv, btn.dataset.action);
   });
   el("paymentCancel").addEventListener("click", () => {
